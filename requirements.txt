@@ -1,0 +1,9 @@
+tensorflow>=2.21,<2.22
+numpy>=1.24
+scipy>=1.11
+scikit-learn>=1.4
+matplotlib>=3.8
+kagglehub>=0.3
+pytest>=8.0
+PyYAML>=6.0
+tensorflow-model-optimization>=0.8,<0.9
