@@ -11,16 +11,19 @@ import androidx.core.content.ContextCompat
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -78,6 +81,7 @@ private fun Week4RealtimeScreen() {
     var panelMessage by remember { mutableStateOf("Say 'go' to activate command panel") }
     var lastAcceptedCommand by remember { mutableStateOf("none") }
     var lastAcceptedAtMs by remember { mutableStateOf(0L) }
+    var selectedPage by rememberSaveable { mutableIntStateOf(0) }
 
     LaunchedEffect(streamState.prediction) {
         val prediction = streamState.prediction ?: return@LaunchedEffect
@@ -158,35 +162,69 @@ private fun Week4RealtimeScreen() {
                     }
                 }
 
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Waveform (latest 1s buffer)")
-                        WaveformView(
-                            samples = streamState.waveform,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(120.dp)
-                                .background(Color(0xFFF4F7FA))
-                                .border(1.dp, Color(0xFFCFD8DC)),
-                        )
-                    }
+                TabRow(selectedTabIndex = selectedPage) {
+                    Tab(
+                        selected = selectedPage == 0,
+                        onClick = { selectedPage = 0 },
+                        text = { Text("Waveform") },
+                    )
+                    Tab(
+                        selected = selectedPage == 1,
+                        onClick = { selectedPage = 1 },
+                        text = { Text("Command") },
+                    )
                 }
 
-                PredictionCard(
-                    prediction = streamState.prediction,
-                    labels = labels,
-                    predictionTimestampMs = streamState.predictionTimestampMs,
-                    formatter = timeFormatter,
-                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                ) {
+                    if (selectedPage == 0) {
+                        WaveformCard(samples = streamState.waveform)
+                    } else {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            PredictionCard(
+                                prediction = streamState.prediction,
+                                labels = labels,
+                                predictionTimestampMs = streamState.predictionTimestampMs,
+                                formatter = timeFormatter,
+                            )
 
-                CommandPanelCard(
-                    x = cursorX,
-                    y = cursorY,
-                    panelActive = panelActive,
-                    panelMessage = panelMessage,
-                    lastAcceptedCommand = lastAcceptedCommand,
-                )
+                            CommandPanelCard(
+                                x = cursorX,
+                                y = cursorY,
+                                panelActive = panelActive,
+                                panelMessage = panelMessage,
+                                lastAcceptedCommand = lastAcceptedCommand,
+                            )
+                        }
+                    }
+                }
             }
+        }
+    }
+}
+
+@Composable
+private fun WaveformCard(samples: FloatArray) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Waveform (latest 1s buffer)", fontWeight = FontWeight.SemiBold)
+            WaveformView(
+                samples = samples,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(220.dp)
+                    .background(Color(0xFFF4F7FA))
+                    .border(1.dp, Color(0xFFCFD8DC)),
+            )
+            Text("Open the Command tab to see prediction and voice command panel.")
         }
     }
 }
@@ -216,18 +254,13 @@ private fun PredictionCard(
             Text("Latency: ${"%.2f".format(prediction.latencyMs)} ms")
             Text("Updated At: $ts")
 
-            LazyColumn(
-                modifier = Modifier.heightIn(max = 220.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                itemsIndexed(prediction.scores.toList()) { idx, score ->
-                    Column {
-                        Text("${labels[idx]}: ${"%.3f".format(score)}")
-                        LinearProgressIndicator(
-                            progress = score.coerceIn(0f, 1f),
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                prediction.scores.forEachIndexed { idx, score ->
+                    Text("${labels[idx]}: ${"%.3f".format(score)}")
+                    LinearProgressIndicator(
+                        progress = { score.coerceIn(0f, 1f) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
             }
         }
