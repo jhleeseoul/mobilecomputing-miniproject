@@ -2,23 +2,26 @@ package com.example.kwsapp.inference
 
 import android.content.Context
 import org.tensorflow.lite.Interpreter
+import java.io.Closeable
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import kotlin.math.exp
+import kotlin.math.abs
 
 class KeywordSpotter(
     private val context: Context,
     private val modelAssetPath: String = "model_int8.tflite",
     private val labels: List<String> = listOf("yes", "no", "up", "down", "left", "right", "stop", "go", "unknown", "silence"),
-) {
+) : Closeable {
     private val mfccExtractor = MfccExtractor()
 
-    private val interpreter: Interpreter by lazy {
+    private val interpreterDelegate = lazy {
         Interpreter(loadModelFile(context, modelAssetPath), Interpreter.Options().apply { setNumThreads(2) })
     }
+    private val interpreter: Interpreter get() = interpreterDelegate.value
 
     data class ModelIO(
         val inputShape: IntArray,
@@ -50,43 +53,54 @@ class KeywordSpotter(
         )
     }
 
+    private val inputElementCount: Int by lazy { io.inputShape.drop(1).reduce { acc, value -> acc * value } }
+    private val outputElementCount: Int by lazy { io.outputShape.last() }
+
+    private val inputBuffer: ByteBuffer by lazy {
+        val bytes = if (io.inputIsInt8) inputElementCount else inputElementCount * 4
+        ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder())
+    }
+    private val outputBufferInt8: Array<ByteArray> by lazy { Array(1) { ByteArray(outputElementCount) } }
+    private val outputBufferFloat: Array<FloatArray> by lazy { Array(1) { FloatArray(outputElementCount) } }
+    private val outputScratch: FloatArray by lazy { FloatArray(outputElementCount) }
+
     fun predict(featureOrAudio: FloatArray): PredictionResult {
         val inputVector = toModelInput(featureOrAudio)
         val startNs = System.nanoTime()
 
-        val output = if (io.outputIsInt8) {
-            val out = Array(1) { ByteArray(io.outputShape.last()) }
-            interpreter.run(buildInputBuffer(inputVector), out)
-            dequantizeOutput(out[0])
+        if (io.outputIsInt8) {
+            interpreter.run(writeInputToBuffer(inputVector), outputBufferInt8)
+            dequantizeOutputInto(outputBufferInt8[0], outputScratch)
         } else {
-            val out = Array(1) { FloatArray(io.outputShape.last()) }
-            interpreter.run(buildInputBuffer(inputVector), out)
-            out[0]
+            interpreter.run(writeInputToBuffer(inputVector), outputBufferFloat)
+            System.arraycopy(outputBufferFloat[0], 0, outputScratch, 0, outputElementCount)
+        }
+
+        val scores = outputScratch.copyOf()
+        if (!isProbabilityDistribution(scores)) {
+            softmaxInPlace(scores)
         }
 
         val latencyMs = (System.nanoTime() - startNs) / 1_000_000f
-        val probs = softmax(output)
-        val topIndex = probs.indices.maxByOrNull { probs[it] } ?: 0
+        val topIndex = scores.indices.maxByOrNull { scores[it] } ?: 0
 
         return PredictionResult(
             topLabel = labels.getOrElse(topIndex) { "class_$topIndex" },
-            topScore = probs[topIndex],
-            scores = probs,
+            topScore = scores[topIndex],
+            scores = scores,
             latencyMs = latencyMs,
         )
     }
 
     private fun toModelInput(featureOrAudio: FloatArray): FloatArray {
-        val featureElementCount = io.inputShape.drop(1).reduce { acc, value -> acc * value }
-
         return when {
-            featureOrAudio.size == featureElementCount -> featureOrAudio
+            featureOrAudio.size == inputElementCount -> featureOrAudio
             featureOrAudio.size >= 8000 -> {
                 val frames = mfccExtractor.extractFromAudio(featureOrAudio, audioSampleRate = 16000)
                 flatten(frames)
             }
             else -> throw IllegalArgumentException(
-                "Input length ${featureOrAudio.size} does not match model feature size $featureElementCount"
+                "Input length ${featureOrAudio.size} does not match model feature size $inputElementCount"
             )
         }
     }
@@ -106,14 +120,9 @@ class KeywordSpotter(
         return flattened
     }
 
-    private fun buildInputBuffer(flattenedFeatures: FloatArray): ByteBuffer {
-        val buffer = if (io.inputIsInt8) {
-            ByteBuffer.allocateDirect(flattenedFeatures.size)
-        } else {
-            ByteBuffer.allocateDirect(flattenedFeatures.size * 4)
-        }
-        buffer.order(ByteOrder.nativeOrder())
-
+    private fun writeInputToBuffer(flattenedFeatures: FloatArray): ByteBuffer {
+        val buffer = inputBuffer
+        buffer.clear()
         if (io.inputIsInt8) {
             require(io.inputScale != 0f) { "Invalid int8 input quantization scale" }
             for (v in flattenedFeatures) {
@@ -129,22 +138,36 @@ class KeywordSpotter(
         return buffer
     }
 
-    private fun dequantizeOutput(raw: ByteArray): FloatArray {
+    private fun dequantizeOutputInto(raw: ByteArray, out: FloatArray) {
         require(io.outputScale != 0f) { "Invalid int8 output quantization scale" }
-        return FloatArray(raw.size) { idx -> (raw[idx].toInt() - io.outputZeroPoint) * io.outputScale }
+        for (i in raw.indices) {
+            out[i] = (raw[i].toInt() - io.outputZeroPoint) * io.outputScale
+        }
     }
 
-    private fun softmax(logits: FloatArray): FloatArray {
+    private fun isProbabilityDistribution(values: FloatArray): Boolean {
+        if (values.isEmpty()) return false
+        var sum = 0f
+        for (value in values) {
+            if (!value.isFinite()) return false
+            if (value < -1e-3f || value > 1.001f) return false
+            sum += value
+        }
+        return abs(sum - 1f) <= 0.05f
+    }
+
+    private fun softmaxInPlace(logits: FloatArray) {
         val max = logits.maxOrNull() ?: 0f
-        val exps = FloatArray(logits.size)
         var sum = 0.0
         for (i in logits.indices) {
-            exps[i] = exp((logits[i] - max).toDouble()).toFloat()
-            sum += exps[i]
+            logits[i] = exp((logits[i] - max).toDouble()).toFloat()
+            sum += logits[i]
         }
-        if (sum == 0.0) return exps
+        if (sum == 0.0) return
 
-        return FloatArray(logits.size) { i -> (exps[i] / sum).toFloat() }
+        for (i in logits.indices) {
+            logits[i] = (logits[i] / sum).toFloat()
+        }
     }
 
     private fun loadModelFile(context: Context, assetPath: String): MappedByteBuffer {
@@ -152,6 +175,12 @@ class KeywordSpotter(
         FileInputStream(descriptor.fileDescriptor).use { inputStream ->
             val channel = inputStream.channel
             return channel.map(FileChannel.MapMode.READ_ONLY, descriptor.startOffset, descriptor.declaredLength)
+        }
+    }
+
+    override fun close() {
+        if (interpreterDelegate.isInitialized()) {
+            interpreterDelegate.value.close()
         }
     }
 }

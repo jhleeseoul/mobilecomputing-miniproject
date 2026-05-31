@@ -1,5 +1,6 @@
 package com.example.kwsapp.inference
 
+import java.util.Arrays
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.ln
@@ -14,6 +15,11 @@ class MfccExtractor(
     private val numMfcc: Int = 13,
     private val normalize: Boolean = true,
 ) {
+    private val analysisWindow: FloatArray by lazy { hann(frameLength) }
+    private val melFilters: Array<FloatArray> by lazy { melFilterBank(sampleRate, fftLength, numMelBins) }
+    private val dctBasis: Array<FloatArray> by lazy { buildDctBasis(numMelBins, numMfcc) }
+    private val spectrumBins: Int = fftLength / 2 + 1
+
     fun extractFromAudio(audio: FloatArray, audioSampleRate: Int): Array<FloatArray> {
         val resampled = if (audioSampleRate == sampleRate) audio else resampleLinear(audio, audioSampleRate, sampleRate)
         val oneSecond = padOrTrim(resampled, sampleRate)
@@ -22,17 +28,19 @@ class MfccExtractor(
 
     fun extractFromWaveform(waveform: FloatArray): Array<FloatArray> {
         val frames = frameSignal(waveform, frameLength, frameStep)
-        val melFilters = melFilterBank(sampleRate, fftLength, numMelBins)
+        val realScratch = DoubleArray(fftLength)
+        val imagScratch = DoubleArray(fftLength)
+        val powerScratch = FloatArray(spectrumBins)
 
         val features = Array(frames.size) { FloatArray(numMfcc) }
         for (i in frames.indices) {
-            val powerSpec = powerSpectrum(frames[i], fftLength)
+            powerSpectrumInPlace(frames[i], realScratch, imagScratch, powerScratch)
             val mel = FloatArray(numMelBins)
 
             for (m in 0 until numMelBins) {
                 var sum = 0.0
-                for (k in powerSpec.indices) {
-                    sum += powerSpec[k] * melFilters[m][k]
+                for (k in 0 until spectrumBins) {
+                    sum += powerScratch[k] * melFilters[m][k]
                 }
                 mel[m] = ln(sum.toFloat() + 1e-6f)
             }
@@ -50,7 +58,7 @@ class MfccExtractor(
 
     private fun frameSignal(signal: FloatArray, length: Int, step: Int): Array<FloatArray> {
         val numFrames = 1 + (signal.size - length).coerceAtLeast(0) / step
-        val window = hamming(length)
+        val window = if (length == frameLength) analysisWindow else hann(length)
         val frames = Array(numFrames) { FloatArray(length) }
 
         for (i in 0 until numFrames) {
@@ -64,31 +72,37 @@ class MfccExtractor(
         return frames
     }
 
-    private fun hamming(length: Int): FloatArray {
+    private fun hann(length: Int): FloatArray {
         val out = FloatArray(length)
+        if (length <= 0) return out
+        if (length == 1) {
+            out[0] = 1f
+            return out
+        }
         for (i in 0 until length) {
-            out[i] = (0.54 - 0.46 * cos(2.0 * PI * i / (length - 1))).toFloat()
+            out[i] = (0.5 - 0.5 * cos(2.0 * PI * i / (length - 1))).toFloat()
         }
         return out
     }
 
-    private fun powerSpectrum(frame: FloatArray, fftSize: Int): FloatArray {
-        val real = DoubleArray(fftSize)
-        val imag = DoubleArray(fftSize)
-
+    private fun powerSpectrumInPlace(
+        frame: FloatArray,
+        real: DoubleArray,
+        imag: DoubleArray,
+        power: FloatArray,
+    ) {
+        Arrays.fill(real, 0.0)
+        Arrays.fill(imag, 0.0)
         for (i in frame.indices) {
             real[i] = frame[i].toDouble()
         }
 
         fftInPlace(real, imag)
-        val bins = fftSize / 2 + 1
-        val power = FloatArray(bins)
-        for (k in 0 until bins) {
+        for (k in power.indices) {
             val r = real[k]
             val im = imag[k]
-            power[k] = ((r * r + im * im) / fftSize).toFloat()
+            power[k] = ((r * r + im * im) / fftLength).toFloat()
         }
-        return power
     }
 
     // Iterative radix-2 Cooley-Tukey FFT.
@@ -174,14 +188,24 @@ class MfccExtractor(
     private fun dctType2(values: FloatArray, outDim: Int): FloatArray {
         val n = values.size
         val out = FloatArray(outDim)
+        val canUseBasis = outDim == dctBasis.size && n == dctBasis.firstOrNull()?.size
         for (k in 0 until outDim) {
             var sum = 0.0
             for (i in 0 until n) {
-                sum += values[i] * cos(PI * k * (2 * i + 1) / (2.0 * n))
+                val basis = if (canUseBasis) dctBasis[k][i] else cos(PI * k * (2 * i + 1) / (2.0 * n)).toFloat()
+                sum += values[i] * basis
             }
             out[k] = sum.toFloat()
         }
         return out
+    }
+
+    private fun buildDctBasis(inputDim: Int, outputDim: Int): Array<FloatArray> {
+        return Array(outputDim) { k ->
+            FloatArray(inputDim) { i ->
+                cos(PI * k * (2 * i + 1) / (2.0 * inputDim)).toFloat()
+            }
+        }
     }
 
     private fun normalizeInPlace(features: Array<FloatArray>) {

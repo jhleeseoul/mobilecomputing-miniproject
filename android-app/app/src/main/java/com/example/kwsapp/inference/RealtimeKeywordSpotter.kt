@@ -9,12 +9,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.max
 
 data class StreamingInferenceState(
@@ -91,6 +93,19 @@ class RealtimeKeywordSpotter(
         _state.update { it.copy(isListening = false) }
     }
 
+    fun close() {
+        val activeJob = readJob
+        stop()
+        if (activeJob != null) {
+            runBlocking {
+                withTimeoutOrNull(1500L) {
+                    activeJob.join()
+                }
+            }
+        }
+        spotter.close()
+    }
+
     private fun createAudioRecord(): AudioRecord {
         val minBufferSize = AudioRecord.getMinBufferSize(
             sampleRate,
@@ -133,7 +148,7 @@ class RealtimeKeywordSpotter(
                 val nowMs = SystemClock.elapsedRealtime()
 
                 if (filled == windowSamples && nowMs - lastInferenceAtMs >= inferenceIntervalMs) {
-                    val rawResult = spotter.predict(rolling.copyOf())
+                    val rawResult = spotter.predict(rolling)
                     val smoothedScores = smoothScores(smoothQueue, rawResult.scores)
                     val topIdx = argmax(smoothedScores)
                     val topScore = if (topIdx >= 0) smoothedScores[topIdx] else 0f
@@ -217,7 +232,7 @@ class RealtimeKeywordSpotter(
     }
 
     private fun smoothScores(queue: ArrayDeque<FloatArray>, scores: FloatArray): FloatArray {
-        queue.addLast(scores.copyOf())
+        queue.addLast(scores)
         while (queue.size > smoothingWindow) {
             queue.removeFirst()
         }

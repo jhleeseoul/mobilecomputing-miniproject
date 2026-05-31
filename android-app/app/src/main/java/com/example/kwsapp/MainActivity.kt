@@ -47,6 +47,10 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private const val BALANCED_TOP_SCORE_THRESHOLD = 0.35f
+private const val BALANCED_MARGIN_THRESHOLD = 0.08f
+private const val COMMAND_COOLDOWN_MS = 350L
+
 @Composable
 private fun Week4RealtimeScreen() {
     val context = LocalContext.current
@@ -85,11 +89,12 @@ private fun Week4RealtimeScreen() {
 
     LaunchedEffect(streamState.prediction) {
         val prediction = streamState.prediction ?: return@LaunchedEffect
-        if (prediction.topScore < 0.72f) return@LaunchedEffect
+        if (prediction.topScore < BALANCED_TOP_SCORE_THRESHOLD) return@LaunchedEffect
+        if (top1Top2Margin(prediction.scores) < BALANCED_MARGIN_THRESHOLD) return@LaunchedEffect
         if (prediction.topLabel == "unknown" || prediction.topLabel == "silence") return@LaunchedEffect
 
         val now = System.currentTimeMillis()
-        if (now - lastAcceptedAtMs < 350L) return@LaunchedEffect
+        if (now - lastAcceptedAtMs < COMMAND_COOLDOWN_MS) return@LaunchedEffect
 
         when (prediction.topLabel) {
             "go" -> {
@@ -115,7 +120,7 @@ private fun Week4RealtimeScreen() {
     }
 
     DisposableEffect(Unit) {
-        onDispose { realtime.stop() }
+        onDispose { realtime.close() }
     }
 
     MaterialTheme {
@@ -209,6 +214,23 @@ private fun Week4RealtimeScreen() {
             }
         }
     }
+}
+
+private fun top1Top2Margin(scores: FloatArray): Float {
+    if (scores.isEmpty()) return 0f
+    var top1 = Float.NEGATIVE_INFINITY
+    var top2 = Float.NEGATIVE_INFINITY
+    for (score in scores) {
+        if (score > top1) {
+            top2 = top1
+            top1 = score
+        } else if (score > top2) {
+            top2 = score
+        }
+    }
+    if (!top1.isFinite()) return 0f
+    if (!top2.isFinite()) return top1
+    return top1 - top2
 }
 
 @Composable
