@@ -47,9 +47,12 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private const val BALANCED_TOP_SCORE_THRESHOLD = 0.35f
-private const val BALANCED_MARGIN_THRESHOLD = 0.08f
+private const val DEFAULT_TOP_SCORE_THRESHOLD = 0.30f
+private const val DEFAULT_MARGIN_THRESHOLD = 0.05f
+private const val RELAXED_TOP_SCORE_THRESHOLD = 0.24f
+private const val RELAXED_MARGIN_THRESHOLD = 0.03f
 private const val COMMAND_COOLDOWN_MS = 350L
+private val RELAXED_THRESHOLD_LABELS = setOf("down", "go")
 
 @Composable
 private fun Week4RealtimeScreen() {
@@ -89,9 +92,13 @@ private fun Week4RealtimeScreen() {
 
     LaunchedEffect(streamState.prediction) {
         val prediction = streamState.prediction ?: return@LaunchedEffect
-        if (prediction.topScore < BALANCED_TOP_SCORE_THRESHOLD) return@LaunchedEffect
-        if (top1Top2Margin(prediction.scores) < BALANCED_MARGIN_THRESHOLD) return@LaunchedEffect
         if (prediction.topLabel == "unknown" || prediction.topLabel == "silence") return@LaunchedEffect
+        val margin = top1Top2Margin(prediction.scores)
+        val useRelaxed = prediction.topLabel in RELAXED_THRESHOLD_LABELS
+        val scoreThreshold = if (useRelaxed) RELAXED_TOP_SCORE_THRESHOLD else DEFAULT_TOP_SCORE_THRESHOLD
+        val marginThreshold = if (useRelaxed) RELAXED_MARGIN_THRESHOLD else DEFAULT_MARGIN_THRESHOLD
+        if (prediction.topScore < scoreThreshold) return@LaunchedEffect
+        if (margin < marginThreshold) return@LaunchedEffect
 
         val now = System.currentTimeMillis()
         if (now - lastAcceptedAtMs < COMMAND_COOLDOWN_MS) return@LaunchedEffect

@@ -17,7 +17,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.sqrt
 
 data class StreamingInferenceState(
     val isListening: Boolean = false,
@@ -32,9 +34,9 @@ class RealtimeKeywordSpotter(
     private val labels: List<String>,
     private val sampleRate: Int = 16000,
     private val windowSamples: Int = 16000,
-    private val inferenceIntervalMs: Long = 320L,
+    private val inferenceIntervalMs: Long = 200L,
     private val waveformPoints: Int = 160,
-    private val smoothingWindow: Int = 3,
+    private val emaAlpha: Float = 0.6f,
 ) {
     private val _state = MutableStateFlow(StreamingInferenceState())
     val state: StateFlow<StreamingInferenceState> = _state.asStateFlow()
@@ -132,7 +134,9 @@ class RealtimeKeywordSpotter(
         val chunkFloat = FloatArray(1024)
         var filled = 0
         var lastInferenceAtMs = 0L
-        val smoothQueue = ArrayDeque<FloatArray>()
+        var emaScores: FloatArray? = null
+        var rmsEma = 0f
+        var agcGain = 1f
 
         try {
             while (kotlinx.coroutines.currentCoroutineContext().isActive) {
@@ -142,6 +146,8 @@ class RealtimeKeywordSpotter(
                 for (i in 0 until read) {
                     chunkFloat[i] = chunkShort[i] / 32768f
                 }
+                agcGain = applyAgcInPlace(chunkFloat, read, previousGain = agcGain, rmsEmaSeed = rmsEma)
+                rmsEma = updateRmsEma(chunkFloat, read, previous = rmsEma)
                 filled = appendToRolling(rolling, filled, chunkFloat, read)
 
                 val waveform = downsample(rolling, if (filled == windowSamples) windowSamples else filled)
@@ -149,21 +155,22 @@ class RealtimeKeywordSpotter(
 
                 if (filled == windowSamples && nowMs - lastInferenceAtMs >= inferenceIntervalMs) {
                     val rawResult = spotter.predict(rolling)
-                    val smoothedScores = smoothScores(smoothQueue, rawResult.scores)
-                    val topIdx = argmax(smoothedScores)
-                    val topScore = if (topIdx >= 0) smoothedScores[topIdx] else 0f
+                    val stabilizedScores = emaBlend(emaScores, rawResult.scores, emaAlpha)
+                    emaScores = stabilizedScores
+                    val topIdx = argmax(stabilizedScores)
+                    val topScore = if (topIdx >= 0) stabilizedScores[topIdx] else 0f
                     val topLabel = labels.getOrElse(topIdx.coerceAtLeast(0)) { "class_$topIdx" }
 
-                    val smoothedResult = rawResult.copy(
+                    val stabilizedResult = rawResult.copy(
                         topLabel = topLabel,
                         topScore = topScore,
-                        scores = smoothedScores,
+                        scores = stabilizedScores,
                     )
 
                     _state.update {
                         it.copy(
                             waveform = waveform,
-                            prediction = smoothedResult,
+                            prediction = stabilizedResult,
                             predictionTimestampMs = System.currentTimeMillis(),
                             errorMessage = null,
                         )
@@ -231,22 +238,68 @@ class RealtimeKeywordSpotter(
         return out
     }
 
-    private fun smoothScores(queue: ArrayDeque<FloatArray>, scores: FloatArray): FloatArray {
-        queue.addLast(scores)
-        while (queue.size > smoothingWindow) {
-            queue.removeFirst()
+    private fun emaBlend(previous: FloatArray?, current: FloatArray, alpha: Float): FloatArray {
+        if (previous == null || previous.size != current.size) {
+            return current.copyOf()
         }
-
-        val out = FloatArray(scores.size)
-        for (item in queue) {
-            for (i in out.indices) {
-                out[i] += item[i]
-            }
-        }
-        for (i in out.indices) {
-            out[i] /= queue.size.toFloat()
+        val out = FloatArray(current.size)
+        val a = alpha.coerceIn(0.0f, 1.0f)
+        val b = 1.0f - a
+        for (i in current.indices) {
+            out[i] = current[i] * a + previous[i] * b
         }
         return out
+    }
+
+    private fun applyAgcInPlace(
+        chunk: FloatArray,
+        valid: Int,
+        previousGain: Float,
+        rmsEmaSeed: Float,
+    ): Float {
+        if (valid <= 0) return previousGain
+        var sumSq = 0.0
+        var clippedCount = 0
+        for (i in 0 until valid) {
+            val v = chunk[i]
+            sumSq += (v * v).toDouble()
+            if (abs(v) >= 0.98f) {
+                clippedCount++
+            }
+        }
+        val chunkRms = sqrt((sumSq / valid.toDouble()).coerceAtLeast(0.0)).toFloat()
+        val rmsEma = if (rmsEmaSeed <= 0f) chunkRms else 0.92f * rmsEmaSeed + 0.08f * chunkRms
+
+        val targetRms = 0.06f
+        val minRms = 1e-3f
+        val noiseFloor = 0.004f
+        val desiredGain = if (rmsEma < noiseFloor) {
+            1.0f
+        } else {
+            (targetRms / rmsEma.coerceAtLeast(minRms)).coerceIn(1.0f, 4.0f)
+        }
+        var gain = (0.8f * previousGain + 0.2f * desiredGain).coerceIn(1.0f, 4.0f)
+
+        val clippedRatio = clippedCount.toFloat() / valid.toFloat()
+        if (clippedRatio > 0.01f) {
+            gain = (gain * 0.85f).coerceAtLeast(1.0f)
+        }
+
+        for (i in 0 until valid) {
+            chunk[i] = (chunk[i] * gain).coerceIn(-1f, 1f)
+        }
+        return gain
+    }
+
+    private fun updateRmsEma(chunk: FloatArray, valid: Int, previous: Float): Float {
+        if (valid <= 0) return previous
+        var sumSq = 0.0
+        for (i in 0 until valid) {
+            val v = chunk[i]
+            sumSq += (v * v).toDouble()
+        }
+        val rms = sqrt((sumSq / valid.toDouble()).coerceAtLeast(0.0)).toFloat()
+        return if (previous <= 0f) rms else 0.92f * previous + 0.08f * rms
     }
 
     private fun argmax(values: FloatArray): Int {
