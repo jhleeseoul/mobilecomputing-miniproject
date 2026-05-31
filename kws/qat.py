@@ -1,4 +1,4 @@
-"""Quantization-Aware Training (QAT) pipeline for small_cnn."""
+"""Quantization-Aware Training (QAT) pipeline for KWS models."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import tensorflow as tf
 from sklearn.metrics import accuracy_score
 
 from kws.benchmark import _materialize_test_set, _run_tflite_inference
+from kws.class_weights import load_labels, resolve_class_weight
 from kws.config import load_config
 from kws.data.dataset import build_dataset_bundle, representative_feature_generator
 from kws.utils import dump_json, ensure_dir, set_global_seed
@@ -25,6 +26,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--qat-model-name", type=str, default="small_cnn_qat")
     parser.add_argument("--qat-epochs", type=int, default=4)
     parser.add_argument("--qat-learning-rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--fit-verbose",
+        type=int,
+        default=-1,
+        choices=[-1, 0, 1, 2],
+        help="Keras fit verbosity override (-1: use config/default, 0/1/2: explicit)",
+    )
     parser.add_argument("--max-items", type=int, default=0)
     parser.add_argument("--representative-samples", type=int, default=400)
     return parser.parse_args()
@@ -53,24 +61,69 @@ def _build_small_cnn_tf_keras(input_shape: Tuple[int, int, int], num_classes: in
     return keras.Model(inputs=inputs, outputs=outputs, name="small_cnn")
 
 
+def _build_ds_cnn_tf_keras(input_shape: Tuple[int, int, int], num_classes: int):
+    import tf_keras as keras
+
+    def ds_block(x, filters: int, stride: Tuple[int, int] = (1, 1), block_idx: int = 0):
+        x = keras.layers.DepthwiseConv2D(
+            (3, 3),
+            strides=stride,
+            padding="same",
+            use_bias=False,
+            name=f"depthwise_conv2d_{block_idx}",
+        )(x)
+        x = keras.layers.BatchNormalization(name=f"batch_normalization_dw_{block_idx}")(x)
+        x = keras.layers.ReLU(name=f"relu_dw_{block_idx}")(x)
+
+        x = keras.layers.Conv2D(
+            filters,
+            (1, 1),
+            padding="same",
+            use_bias=False,
+            name=f"pointwise_conv2d_{block_idx}",
+        )(x)
+        x = keras.layers.BatchNormalization(name=f"batch_normalization_pw_{block_idx}")(x)
+        x = keras.layers.ReLU(name=f"relu_pw_{block_idx}")(x)
+        return x
+
+    inputs = keras.Input(shape=input_shape, name="features")
+    x = keras.layers.Conv2D(32, (3, 3), strides=(2, 2), padding="same", use_bias=False, name="stem_conv2d")(inputs)
+    x = keras.layers.BatchNormalization(name="stem_bn")(x)
+    x = keras.layers.ReLU(name="stem_relu")(x)
+
+    x = ds_block(x, 64, block_idx=0)
+    x = ds_block(x, 64, block_idx=1)
+    x = ds_block(x, 96, stride=(2, 2), block_idx=2)
+    x = ds_block(x, 96, block_idx=3)
+
+    x = keras.layers.GlobalAveragePooling2D(name="global_average_pooling2d")(x)
+    x = keras.layers.Dropout(0.25, name="dropout")(x)
+    outputs = keras.layers.Dense(num_classes, activation="softmax", name="probs")(x)
+    return keras.Model(inputs=inputs, outputs=outputs, name="ds_cnn")
+
+
 def _qat_ready_model_from_base(base_model: tf.keras.Model, cfg: Dict):
     import tf_keras as keras
     import tensorflow_model_optimization as tfmot
 
-    if base_model.name != "small_cnn":
-        raise ValueError(
-            "QAT helper currently supports only small_cnn architecture. "
-            f"Loaded model name: {base_model.name}"
+    model_name = str(base_model.name).strip().lower()
+    if model_name == "small_cnn":
+        legacy_model = _build_small_cnn_tf_keras(
+            input_shape=tuple(base_model.input_shape[1:]),
+            num_classes=int(cfg["num_classes"]),
         )
+    elif model_name == "ds_cnn":
+        legacy_model = _build_ds_cnn_tf_keras(
+            input_shape=tuple(base_model.input_shape[1:]),
+            num_classes=int(cfg["num_classes"]),
+        )
+    else:
+        raise ValueError(f"Unsupported base model for QAT: {base_model.name}")
 
-    legacy_model = _build_small_cnn_tf_keras(
-        input_shape=tuple(base_model.input_shape[1:]),
-        num_classes=int(cfg["num_classes"]),
-    )
     legacy_model.set_weights(base_model.get_weights())
 
     def annotate(layer):
-        if isinstance(layer, (keras.layers.Conv2D, keras.layers.Dense)):
+        if isinstance(layer, (keras.layers.Conv2D, keras.layers.Dense, keras.layers.DepthwiseConv2D)):
             return tfmot.quantization.keras.quantize_annotate_layer(layer)
         return layer
 
@@ -159,6 +212,11 @@ def main() -> None:
 
     max_items = args.max_items if args.max_items > 0 else None
     manifest_path = args.manifest or cfg["paths"]["manifest"]
+    labels = load_labels(cfg, manifest_path=manifest_path)
+    class_weight = resolve_class_weight(cfg, labels)
+    fit_verbose = int(cfg["train"].get("fit_verbose", 2))
+    if args.fit_verbose >= 0:
+        fit_verbose = int(args.fit_verbose)
 
     base_model_path = (
         Path(args.base_model_path)
@@ -202,7 +260,8 @@ def main() -> None:
         validation_data=bundle.val,
         epochs=int(args.qat_epochs),
         callbacks=callbacks,
-        verbose=1,
+        class_weight=class_weight,
+        verbose=fit_verbose,
     )
 
     test_loss, test_acc = qat_model.evaluate(bundle.test, verbose=0)
@@ -236,6 +295,7 @@ def main() -> None:
         "qat_learning_rate": float(args.qat_learning_rate),
         "qat_test_loss": float(test_loss),
         "qat_test_accuracy": float(test_acc),
+        "class_weight": class_weight or {},
         "float32_tflite_path": str(float_path),
         "int8_qat_tflite_path": str(int8_qat_path),
         "benchmark": benchmark,

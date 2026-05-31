@@ -8,6 +8,7 @@ from typing import Dict
 
 import tensorflow as tf
 
+from kws.class_weights import load_labels, resolve_class_weight
 from kws.config import load_config
 from kws.data.dataset import build_dataset_bundle
 from kws.models.factory import build_model
@@ -21,6 +22,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=str, default="")
     parser.add_argument("--epochs", type=int, default=0, help="Override epochs from config if >0")
     parser.add_argument("--max-items", type=int, default=0, help="Limit items per split for smoke testing")
+    parser.add_argument(
+        "--fit-verbose",
+        type=int,
+        default=-1,
+        choices=[-1, 0, 1, 2],
+        help="Keras fit verbosity override (-1: use config/default, 0/1/2: explicit)",
+    )
     return parser.parse_args()
 
 
@@ -41,7 +49,10 @@ def main() -> None:
     set_global_seed(seed)
 
     max_items = args.max_items if args.max_items > 0 else None
-    bundle = build_dataset_bundle(cfg, manifest_path=args.manifest or None, max_items=max_items)
+    manifest_path = args.manifest or cfg["paths"]["manifest"]
+    bundle = build_dataset_bundle(cfg, manifest_path=manifest_path, max_items=max_items)
+    labels = load_labels(cfg, manifest_path=manifest_path)
+    class_weight = resolve_class_weight(cfg, labels)
     train_cardinality = int(tf.data.experimental.cardinality(bundle.train).numpy())
     configured_spe = int(cfg["train"].get("steps_per_execution", 1))
     if train_cardinality > 0:
@@ -60,6 +71,9 @@ def main() -> None:
     )
 
     epochs = args.epochs if args.epochs > 0 else int(cfg["train"]["epochs"])
+    fit_verbose = int(cfg["train"].get("fit_verbose", 2))
+    if args.fit_verbose >= 0:
+        fit_verbose = int(args.fit_verbose)
 
     model_dir = ensure_dir(Path(cfg["paths"]["models_dir"]) / args.model)
     callbacks = [
@@ -76,7 +90,14 @@ def main() -> None:
         ),
     ]
 
-    history = model.fit(bundle.train, validation_data=bundle.val, epochs=epochs, callbacks=callbacks)
+    history = model.fit(
+        bundle.train,
+        validation_data=bundle.val,
+        epochs=epochs,
+        callbacks=callbacks,
+        class_weight=class_weight,
+        verbose=fit_verbose,
+    )
 
     test_loss, test_acc = model.evaluate(bundle.test, verbose=0)
     model.save(model_dir / "last_model.keras")
@@ -93,6 +114,7 @@ def main() -> None:
         "epochs_ran": len(history.history.get("loss", [])),
         "test_loss": float(test_loss),
         "test_accuracy": float(test_acc),
+        "class_weight": class_weight or {},
     }
     dump_json(train_summary, model_dir / "train_summary.json")
 
