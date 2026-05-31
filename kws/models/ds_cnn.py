@@ -27,7 +27,8 @@ def build_ds_cnn(input_shape: Tuple[int, int, int], num_classes: int) -> tf.kera
 
     x = _ds_block(x, 64)
     x = _ds_block(x, 64)
-    x = _ds_block(x, 96, stride=(2, 1))
+    # TensorFlow CPU depthwise kernel requires equal row/col stride.
+    x = _ds_block(x, 96, stride=(2, 2))
     x = _ds_block(x, 96)
 
     x = tf.keras.layers.GlobalAveragePooling2D()(x)
