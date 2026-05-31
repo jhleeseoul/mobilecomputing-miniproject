@@ -38,6 +38,12 @@ Optional:
 python -m kws.train --config configs/default_config.json --model ds_cnn
 ```
 
+Quiet logs (WSL/session 안정성 목적):
+
+```bash
+python -m kws.train --config configs/default_config.json --model small_cnn --fit-verbose 2
+```
+
 ## D. Evaluate
 
 ```bash
@@ -61,7 +67,19 @@ Review:
 - `artifacts/reports/small_cnn/benchmark_report.json`
 - `artifacts/reports/small_cnn/quantization_comparison.md`
 
-## G. Android Realtime Inference
+## G. QAT (int8 deploy model)
+
+```bash
+python -m kws.qat --config configs/default_config.json --base-model small_cnn --qat-model-name small_cnn_qat --qat-epochs 20 --qat-learning-rate 1e-5 --fit-verbose 2
+```
+
+Optional comparison run:
+
+```bash
+python -m kws.qat --config configs/default_config.json --base-model ds_cnn --qat-model-name ds_cnn_qat --qat-epochs 20 --qat-learning-rate 1e-5 --fit-verbose 2
+```
+
+## H. Android Realtime Inference
 
 ```bash
 bash scripts/copy_model_to_android_assets.sh artifacts/models/small_cnn_qat/model_int8_qat.tflite
