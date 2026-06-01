@@ -52,6 +52,8 @@ private const val DEFAULT_MARGIN_THRESHOLD = 0.05f
 private const val RELAXED_TOP_SCORE_THRESHOLD = 0.24f
 private const val RELAXED_MARGIN_THRESHOLD = 0.03f
 private const val COMMAND_COOLDOWN_MS = 350L
+private const val SAME_COMMAND_SUPPRESS_MS = 900L
+private const val COMMAND_REARM_FACTOR = 0.55f
 private val RELAXED_THRESHOLD_LABELS = setOf("down", "go")
 
 @Composable
@@ -88,22 +90,46 @@ private fun Week4RealtimeScreen() {
     var panelMessage by remember { mutableStateOf("Say 'go' to activate command panel") }
     var lastAcceptedCommand by remember { mutableStateOf("none") }
     var lastAcceptedAtMs by remember { mutableStateOf(0L) }
+    var latchedCommand by remember { mutableStateOf<String?>(null) }
     var selectedPage by rememberSaveable { mutableIntStateOf(0) }
 
     LaunchedEffect(streamState.prediction) {
         val prediction = streamState.prediction ?: return@LaunchedEffect
-        if (prediction.topLabel == "unknown" || prediction.topLabel == "silence") return@LaunchedEffect
+        val topLabel = prediction.topLabel
+        val isUnknownOrSilence = topLabel == "unknown" || topLabel == "silence"
         val margin = top1Top2Margin(prediction.scores)
-        val useRelaxed = prediction.topLabel in RELAXED_THRESHOLD_LABELS
+        val useRelaxed = topLabel in RELAXED_THRESHOLD_LABELS
         val scoreThreshold = if (useRelaxed) RELAXED_TOP_SCORE_THRESHOLD else DEFAULT_TOP_SCORE_THRESHOLD
         val marginThreshold = if (useRelaxed) RELAXED_MARGIN_THRESHOLD else DEFAULT_MARGIN_THRESHOLD
-        if (prediction.topScore < scoreThreshold) return@LaunchedEffect
-        if (margin < marginThreshold) return@LaunchedEffect
+        val isConfidentCommand = !isUnknownOrSilence && prediction.topScore >= scoreThreshold && margin >= marginThreshold
+
+        if (!isConfidentCommand) {
+            val locked = latchedCommand
+            if (locked != null) {
+                val lockedBaseThreshold = if (locked in RELAXED_THRESHOLD_LABELS) {
+                    RELAXED_TOP_SCORE_THRESHOLD
+                } else {
+                    DEFAULT_TOP_SCORE_THRESHOLD
+                }
+                val lockedScore = scoreForLabel(prediction.scores, labels, locked)
+                val rearmThreshold = lockedBaseThreshold * COMMAND_REARM_FACTOR
+                val switchedLabel = topLabel != locked
+                if (switchedLabel || lockedScore < rearmThreshold) {
+                    latchedCommand = null
+                }
+            }
+            return@LaunchedEffect
+        }
+
+        if (latchedCommand == topLabel) return@LaunchedEffect
 
         val now = System.currentTimeMillis()
+        if (topLabel == lastAcceptedCommand && now - lastAcceptedAtMs < SAME_COMMAND_SUPPRESS_MS) {
+            return@LaunchedEffect
+        }
         if (now - lastAcceptedAtMs < COMMAND_COOLDOWN_MS) return@LaunchedEffect
 
-        when (prediction.topLabel) {
+        when (topLabel) {
             "go" -> {
                 panelActive = true
                 panelMessage = "ACTIVE"
@@ -122,8 +148,9 @@ private fun Week4RealtimeScreen() {
             "no" -> panelMessage = "Cancelled"
         }
 
-        lastAcceptedCommand = prediction.topLabel
+        lastAcceptedCommand = topLabel
         lastAcceptedAtMs = now
+        latchedCommand = topLabel
     }
 
     DisposableEffect(Unit) {
@@ -238,6 +265,12 @@ private fun top1Top2Margin(scores: FloatArray): Float {
     if (!top1.isFinite()) return 0f
     if (!top2.isFinite()) return top1
     return top1 - top2
+}
+
+private fun scoreForLabel(scores: FloatArray, labels: List<String>, label: String): Float {
+    val idx = labels.indexOf(label)
+    if (idx < 0 || idx >= scores.size) return 0f
+    return scores[idx]
 }
 
 @Composable
